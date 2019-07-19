@@ -3,11 +3,6 @@
 '''
 Плагин для создания документов XODT.
 
-Алгоритм воспроизведен по коду ЭОС.
-Шаблон документа содержит таблицу подписантов. Выходной документ содержит:
-таблицу подписантов,
-
-
 1. отключить отслеживание изменений т.к. будем модифицировать документ, //TracksOnOff(true); 
 2. Сформировать таблицу подписантов.  //CreateSignerTable();
 2.1 Варианты: а) Шаблон содержит закзадку LISTSIGNERSSTAMPS б) Шаблон сореджит готовую 
@@ -48,7 +43,7 @@
 
 import abc
 import threading
-import os.path
+import os
 import logging
 import declxml as xml
 import re 
@@ -143,6 +138,150 @@ class AddrTableBuilder(AbstractEntryBuilder):
 
     def update(self):
         pass
+
+class AddrTableBuilder(AbstractEntryBuilder):
+    def __init_ (self, doc, xml_data):
+        self.doc = doc
+        self.xml_data = xml_data
+
+    def __get_fixed_placeholders(self, names_wanted):
+        '''
+Построить список подтвержденных имен букмарков для вставки данных 
+подписантов, а также кол-во подписантов, уже обеспеченных букмарками
+в шаблоне.
+Параметры:
+app - Объект приложения MyOffice CoreAPI, для доступа к структуре
+        документа-шаблона.
+names_wanted - список шаблонов-наименований для букмарков,
+                типа SIGNERNAME, SIGNERPOST
+Возвращает:
+max_index - кол-во подписантов для которых в шаблоне уже имеются 
+            букмарки
+exist - список подтвержденных имен букмарков в шаблоне, для вставки 
+        данных подписантов
+        '''
+        bookmarks = self.doc.getBookmarks()
+        '''
+        TODO Сейчас нет возможности получить точное количество букмарков в
+        документе, поэтому мы предполагаем что подписантов м.б. не более 30 и ищем
+        букмарки с именами типа SIGNERDUE1-SIGNERDUE30
+        '''
+        # Формируем список всех возможных имен букмарков
+        wanted = ["{0}{1}".format(n, bi) for bi in range(1, 31) for n in names_wanted]
+        exist = []
+        for bmk_name in wanted:
+            # Подтверждаем наличие букмарка с таким именем в документе-шаблоне
+            bmk_rng = bookmarks.getBookmarkRange(bmk_name)
+            if bmk_rng is not None:
+                exist.append(bmk_name)
+        for txt_name in wanted:
+            search = mof.createSearch(self.doc)
+            rngs = search.findText("[{0}]".format(txt_name))
+            if rngs is not None:
+                for r in rngs:
+                    exist.append("[{0}]".format(txt_name))
+        '''
+        exist содержит список подтвержденных имен, возьмем последний элемент
+        и вырежем из него номер.
+        '''
+        max_index = 0
+        if len(exist):
+            #max_index = int(re.sub('[a-zA-Z]', '', exist[-1]))
+            max_index = int(filter(str.isdigit,exist[-1]))
+        return max_index, exist
+    
+    def __get_data_items(self):
+        '''
+        Построить список элементов данных, для вставки в указанные позиции 
+        (закладки).
+        Параметры:
+        нет
+        Возвращает:
+        max_index - кол-во элементов данных
+        exist - список элементов данных
+        '''
+        addr_proc = xml.dictionary('PASSPORT/ADDRLIST', [
+        xml.array(xml.user_object('AddrInfo', Signer, [
+                xml.string('ADDRORG',    alias='addrorg'),
+                xml.string('ADDRSPOST',  alias='addrspost'),
+                xml.string('ADDRLPOST',  alias='addrlpost'),
+                xml.string('ADDRNAME',   alias='addrname'),
+                xml.string('ADDRADRESS', alias='addraddress'),
+                xml.string('ADDRKIND',   alias='addrkind')
+            ], alias='slist'))
+        ])
+        s = xml.parse_from_file(addr_proc,  self.xml_data)
+        return s['slist']
+    
+    def update(self):
+        logging.debug('AddrTableBuilder started')
+        #Список всех шаблонов для вставки инфо о подписантах.
+        fixed_plh_count, fixed_plh_list = \
+                self.__get_fixed_placeholders(["ADDRORG", "ADDRSPOST", \
+                                        "ADDRLPOST", "ADDRNAME", "ADDRADRESS"])
+        addr_list = self.__get_data_items()
+        addr_count = len(addr_list)
+        bookmarks = self.doc.getBookmarks()
+        if(addr_count > fixed_plh_count):        
+            #Адресов больше чем сидячих мест, вставим доп таблицу...
+            addr_plh_name  = 'LISTADDR'
+            addr_plh_table = bookmarks.getBookmarkRange(addr_plh_name)
+            if addr_plh_table is not None:
+                #...если есть куда.
+                t_addr = self.__insert_table(addr_plh_table, (addr_count - fixed_plh_count), 1)
+                t_addr.setColumnWidth(0, 447)
+                for r in range(0, addr_count-fixed_plh_count):
+                    cell = t_addr.getCell(mof.CellPosition(r,0))
+                    cell.getRange().getBegin().insertText("[ADDR{0}]".format(str(fixed_plh_count+r+1)))
+                    entry = addr_list[fixed_plh_count+r+1]
+                    if entry.addrkind is 'ORGANIZ':
+                        fill_entry(DummyEntryBuilder(self.doc, 
+                                                    "[ADDR{0}]".format(str(fixed_plh_count+r+1)), 
+                                                    '{0}, {1}, {2}, {3}'.format(entry.addrorg,
+                                                                                entry.addrspost,
+                                                                                entry.addrname,
+                                                                                entry.addraddress)))
+                    elif entry.addrkind is 'CITIZEN':
+                        fill_entry(DummyEntryBuilder(self.doc, 
+                                                    "[ADDR{0}]".format(str(fixed_plh_count+r+1)), 
+                                                    '{0}, {1}'.format(entry.addrname,
+                                                                        entry.addraddress)))
+                    elif entry.addrkind is 'DEPARTMENT':
+                        fill_entry(DummyEntryBuilder(self.doc, 
+                                                    "[ADDR{0}]".format(str(fixed_plh_count+r+1)), 
+                                                    '{0}, {1}, {2}'.format(entry.addrorg, 
+                                                                            entry.addrspost, 
+                                                                            entry.addrname)))                    
+                #
+                addr_plh_table.replaceText('')
+                self.doc.getBookmarks().removeBookmark(addr_plh_name)
+            else:
+                logging.warning('XOD Worker, not enough room to insert all addresses. Bookmark LISTADDR is absent')
+        #Bookmarks content replacement
+        for plh in fixed_plh_list:
+            data_index = int(filter(str.isdigit,plh))
+            entry = addr_list[data_index-1]
+            if entry.addrkind is 'ORGANIZ':
+                fill_entry(DummyEntryBuilder(self.doc, 
+                                                plh, 
+                                                '{0}, {1}, {2}, {3}'.format(entry.addrorg,
+                                                                            entry.addrspost,
+                                                                            entry.addrname,
+                                                                            entry.addraddress)))
+            elif entry.addrkind is 'CITIZEN':
+                fill_entry(DummyEntryBuilder(self.doc, 
+                                                plh, 
+                                                '{0}, {1}'.format(entry.addrname,
+                                                                    entry.addraddress)))
+            elif entry.addrkind is 'DEPARTMENT':
+                fill_entry(DummyEntryBuilder(self.doc, 
+                                                plh, 
+                                                '{0}, {1}, {2}'.format(entry.addrorg, 
+                                                                        entry.addrspost, 
+                                                                        entry.addrname))) 
+        #EOFunction
+        logging.debug('AddrTableBuilder done')
+
 
 class SignersTableBuilder(AbstractEntryBuilder):
     def __init__(self, doc, xml_data):
@@ -330,10 +469,8 @@ def worker(path_t, path_o, xml_file):
     app.doc  = app.loadDocument(path_t)
     
     fill_entry(SignersTableBuilder(app.doc, xml_file))
-    '''
-    app.doc = fill_table(AddrTableBuilder(app.doc, xml_file))
-    '''
-
+    fill_entry(AddrTableBuilder(app.doc, xml_file))
+    
     fill_entry(ExecutorEntryBuilder(app.doc, xml_file))
     fill_entry(AnnotationEntryBuilder(app.doc, xml_file))
 
